@@ -10,6 +10,8 @@ let isConnected = false;
 let statusListeners = [];
 let pairingCodeInfo = null;
 let logger = P({ level: 'silent' });
+let socketReadyResolve = null;
+let socketReadyPromise = null;
 
 function notifyListeners() {
   const status = getStatus();
@@ -41,6 +43,10 @@ async function init() {
   const { state, saveCreds } = await useMultiFileAuthState(DATA_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  socketReadyPromise = new Promise((resolve) => {
+    socketReadyResolve = resolve;
+  });
+
   sock = makeWASocket({
     version,
     logger,
@@ -55,11 +61,22 @@ async function init() {
   });
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr && !isConnected && !sock.authState.creds.registered) {
+      if (socketReadyResolve) {
+        socketReadyResolve();
+        socketReadyResolve = null;
+      }
+    }
 
     if (connection === 'open') {
       isConnected = true;
       pairingCodeInfo = null;
+      if (socketReadyResolve) {
+        socketReadyResolve();
+        socketReadyResolve = null;
+      }
       notifyListeners();
     }
 
@@ -84,6 +101,10 @@ async function init() {
 
   if (sock.authState.creds.registered) {
     isConnected = true;
+    if (socketReadyResolve) {
+      socketReadyResolve();
+      socketReadyResolve = null;
+    }
     notifyListeners();
   }
 
@@ -100,6 +121,21 @@ async function requestPairingCode(phoneNumber) {
     return getStatus();
   }
 
+  if (!sock.authState.creds.registered) {
+    try {
+      if (socketReadyPromise) {
+        await Promise.race([
+          socketReadyPromise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Socket connection timeout')), 30000))
+        ]);
+      }
+    } catch (e) {
+      pairingCodeInfo = { error: 'Connection timeout: ' + e.message, phone: cleanPhone };
+      notifyListeners();
+      return getStatus();
+    }
+  }
+
   try {
     const code = await sock.requestPairingCode(cleanPhone);
     const formatted = code.toString().match(/.{1,4}/g)?.join('-') || code.toString();
@@ -112,7 +148,6 @@ async function requestPairingCode(phoneNumber) {
         notifyListeners();
       }
     }, 120000);
-    const orig = pairingCodeInfo;
     const origUnsub = onStatusChange((s) => {
       if (s.connected) { clearTimeout(timeout); origUnsub(); }
     });
@@ -134,6 +169,8 @@ async function disconnect() {
   }
   isConnected = false;
   pairingCodeInfo = null;
+  socketReadyPromise = null;
+  socketReadyResolve = null;
   notifyListeners();
   return getStatus();
 }
