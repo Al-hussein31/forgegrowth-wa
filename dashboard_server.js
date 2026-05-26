@@ -2,6 +2,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+let wa;
+try { wa = require('./wa_manager.js'); } catch (e) { wa = null; }
 
 const ROOT = __dirname;
 const CAMPAIGN = path.join(ROOT, 'dm_campaign.json');
@@ -298,9 +300,25 @@ async function handleApi(req, res, url) {
             return sendJson(res, 200, stopAutomation());
         }
 
+        if (url.pathname === '/api/wa/status' || url.pathname === '/api/wa/connect' || url.pathname === '/api/wa/pair' || url.pathname === '/api/wa/disconnect') {
+            if (!wa) return sendJson(res, 500, { error: 'WhatsApp manager not available (Baileys missing?)' });
+        }
+
         if (req.method === 'GET' && url.pathname === '/api/wa/status') {
-            const status = await runWaStatus();
-            return sendJson(res, 200, status);
+            return sendJson(res, 200, wa.getStatus());
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/wa/connect') {
+            return sendJson(res, 200, await wa.init());
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/wa/pair') {
+            const body = await readBody(req);
+            return sendJson(res, 200, await wa.requestPairingCode(body.phone || ''));
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/wa/disconnect') {
+            return sendJson(res, 200, await wa.disconnect());
         }
 
         if (req.method === 'POST' && url.pathname === '/api/reschedule-overdue') {
@@ -506,6 +524,29 @@ pre { white-space: pre-wrap; background: #0b1f33; color: #d9eafd; border-radius:
     <span class="pill selectedCount" id="selectedCount">0 selected</span>
   </section>
 
+  <div id="waPanel" style="display:none;padding:12px 18px;background:#fff;border-bottom:1px solid var(--line)">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <b>WhatsApp Connection</b>
+      <span id="waPanelStatus" class="pill" style="background:#eefaf5;color:var(--ok)">Unknown</span>
+      <span id="waPanelUser" style="color:var(--muted);font-size:13px"></span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
+      <input id="waPhone" placeholder="Phone e.g. 2349010926847" style="height:36px;border:1px solid var(--line);border-radius:6px;padding:0 10px;width:200px">
+      <button onclick="waConnect()">Init Connection</button>
+      <button class="primary" onclick="waGetPairingCode()">Get Pairing Code</button>
+      <button class="danger" onclick="waDisconnect()">Disconnect</button>
+    </div>
+    <div id="waPairCode" style="margin-top:10px;display:none">
+      <div style="background:#fff8e5;border:1px solid #f5d37b;border-radius:8px;padding:16px;text-align:center">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">On your phone, go to WhatsApp > Linked Devices > Link a Device > <b>Pair with Code</b></div>
+        <div id="waPairCodeDisplay" style="font-size:28px;font-weight:700;letter-spacing:6px;font-family:monospace;color:var(--text);padding:12px;background:#fff;border-radius:6px;display:inline-block"></div>
+        <div id="waPairError" style="color:var(--bad);font-size:13px;margin-top:8px"></div>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px">Code expires in 2 minutes</div>
+      </div>
+    </div>
+    <pre id="waOutput" style="margin-top:10px;max-height:100px;display:none"></pre>
+  </div>
+
   <main class="main">
     <div class="tableWrap">
       <table>
@@ -603,7 +644,7 @@ function renderStats() {
   ];
   document.getElementById('stats').innerHTML = stats.map(([label, value]) => '<div class="stat"><b>'+value+'</b><span>'+label+'</span></div>').join('')
     + '<div class="stat"><b id="automationStatus">'+escapeHtml(state.automation?.status || 'stopped')+'</b><span>Automation</span><div class="row"><button onclick="startAutomation()">Start</button><button onclick="stopAutomation()">Stop</button></div></div>'
-    + '<div class="stat"><b id="waStatus">Unknown</b><span>WhatsApp</span><br><button onclick="checkWa()">Check WA</button></div>'
+    + '<div class="stat"><b id="waStatus">Unknown</b><span>WhatsApp</span><div class="row"><button onclick="toggleWaPanel()">Manage</button><button onclick="checkWa()">Check</button></div></div>'
     + '<div class="stat"><b id="overdueCount">'+countOverdue()+'</b><span>Overdue pending</span><br><button onclick="rescheduleOverdue()">Reschedule</button></div>';
 }
 
@@ -777,10 +818,85 @@ async function checkWaLive() {
   try {
     const status = await api('/api/wa/status');
     el.textContent = status.connected ? 'Connected' : 'Not connected';
-    el.title = status.error || ('Checked at ' + status.checkedAt);
+    el.title = status.error || '';
+    updateWaPanel(status);
   } catch (e) {
     el.textContent = 'Error';
     el.title = e.message;
+  }
+}
+
+function toggleWaPanel() {
+  const panel = document.getElementById('waPanel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  if (panel.style.display === 'block') checkWa();
+}
+
+function updateWaPanel(status) {
+  const el = document.getElementById('waPanelStatus');
+  const user = document.getElementById('waPanelUser');
+  if (!el) return;
+  if (status.connected) {
+    el.textContent = 'Connected';
+    el.style.background = '#eefaf5'; el.style.color = 'var(--ok)';
+    user.textContent = status.user || '';
+  } else if (status.pairingCode) {
+    el.textContent = 'Pairing...';
+    el.style.background = '#fff8e5'; el.style.color = 'var(--warn)';
+    user.textContent = '';
+    document.getElementById('waPairCode').style.display = 'block';
+    document.getElementById('waPairCodeDisplay').textContent = status.pairingCode;
+    document.getElementById('waPairError').textContent = '';
+  } else if (status.error) {
+    el.textContent = 'Error';
+    el.style.background = '#fff0ee'; el.style.color = 'var(--bad)';
+    user.textContent = status.error;
+  } else {
+    el.textContent = 'Not connected';
+    el.style.background = '#f1f5f9'; el.style.color = 'var(--muted)';
+    user.textContent = '';
+  }
+}
+
+async function waConnect() {
+  const out = document.getElementById('waOutput');
+  out.style.display = 'block';
+  out.textContent = 'Initializing WhatsApp connection...';
+  try {
+    const result = await api('/api/wa/connect', { method: 'POST' });
+    out.textContent = JSON.stringify(result, null, 2);
+    updateWaPanel(result);
+  } catch (e) {
+    out.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function waGetPairingCode() {
+  const phone = document.getElementById('waPhone').value.trim();
+  const out = document.getElementById('waOutput');
+  document.getElementById('waPairCode').style.display = 'none';
+  out.style.display = 'block';
+  out.textContent = 'Requesting pairing code...';
+  try {
+    const result = await api('/api/wa/pair', { method: 'POST', body: JSON.stringify({ phone }) });
+    out.textContent = JSON.stringify(result, null, 2);
+    updateWaPanel(result);
+  } catch (e) {
+    out.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function waDisconnect() {
+  const out = document.getElementById('waOutput');
+  out.style.display = 'block';
+  out.textContent = 'Disconnecting...';
+  try {
+    const result = await api('/api/wa/disconnect', { method: 'POST' });
+    out.textContent = JSON.stringify(result, null, 2);
+    document.getElementById('waPairCode').style.display = 'none';
+    updateWaPanel(result);
+  } catch (e) {
+    out.textContent = 'Error: ' + e.message;
   }
 }
 
@@ -841,7 +957,7 @@ setInterval(async () => {
 }, 5000);
 
 setInterval(refreshCampaignLive, 3000);
-setInterval(checkWaLive, 60000);
+setInterval(checkWaLive, 5000);
 
 function formatDate(value) {
   if (!value) return '';
@@ -853,6 +969,7 @@ function escapeHtml(value) {
 }
 
 loadCampaign();
+setTimeout(checkWaLive, 500);
 </script>
 </body>
 </html>`;
