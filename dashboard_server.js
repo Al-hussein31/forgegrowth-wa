@@ -1,6 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const { spawn } = require('child_process');
 let wa;
 try { wa = require('./wa_manager.js'); } catch (e) { wa = null; }
@@ -117,11 +118,27 @@ function stopAutomation() {
 }
 
 function sendJson(res, status, data) {
+    const json = JSON.stringify(data, null, 2);
     res.writeHead(status, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'no-store'
     });
-    res.end(JSON.stringify(data, null, 2));
+    res.end(json);
+}
+
+function sendGzipJson(res, status, data, accept) {
+    const json = JSON.stringify(data, null, 2);
+    if (accept && accept.includes('gzip') && json.length > 1024) {
+        const compressed = zlib.gzipSync(json);
+        res.writeHead(status, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Content-Encoding': 'gzip',
+            'Cache-Control': 'no-store'
+        });
+        res.end(compressed);
+    } else {
+        sendJson(res, status, data);
+    }
 }
 
 function sendHtml(res, html) {
@@ -294,12 +311,12 @@ async function handleApi(req, res, url) {
         if (req.method === 'GET' && url.pathname === '/api/campaign') {
             const campaign = loadCampaign();
             const sentLog = loadSentLog();
-            return sendJson(res, 200, {
+            return sendGzipJson(res, 200, {
                 summary: summarize(campaign, sentLog),
                 automation: loadAutomationState(),
                 schedule: campaign.schedule.map(publicItemList),
                 skippedContacts: campaign.skippedContacts || []
-            });
+            }, req.headers['accept-encoding']);
         }
 
         if (req.method === 'GET' && url.pathname.startsWith('/api/message/')) {
@@ -307,7 +324,7 @@ async function handleApi(req, res, url) {
             const campaign = loadCampaign();
             const item = campaign.schedule.find(entry => entry.id === id);
             if (!item) return sendJson(res, 404, { error: 'Message not found' });
-            return sendJson(res, 200, publicItem(item));
+            return sendGzipJson(res, 200, publicItem(item), req.headers['accept-encoding']);
         }
 
         if (req.method === 'GET' && url.pathname === '/api/automation/status') {
