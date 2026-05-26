@@ -339,8 +339,8 @@ async function handleApi(req, res, url) {
             return sendJson(res, 200, stopAutomation());
         }
 
-        if (url.pathname === '/api/wa/status' || url.pathname === '/api/wa/connect' || url.pathname === '/api/wa/pair' || url.pathname === '/api/wa/disconnect') {
-            if (!wa) return sendJson(res, 500, { error: 'WhatsApp manager not available (Baileys missing?)' });
+        if (url.pathname === '/api/wa/status' || url.pathname === '/api/wa/connect' || url.pathname === '/api/wa/pair' || url.pathname === '/api/wa/disconnect' || url.pathname === '/api/wa/reset') {
+            if (!wa) return sendJson(res, 500, { error: 'WhatsApp manager not available' });
         }
 
         if (req.method === 'GET' && url.pathname === '/api/wa/status') {
@@ -358,6 +358,10 @@ async function handleApi(req, res, url) {
 
         if (req.method === 'POST' && url.pathname === '/api/wa/disconnect') {
             return sendJson(res, 200, await wa.disconnect());
+        }
+
+        if (req.method === 'POST' && url.pathname === '/api/wa/reset') {
+            return sendJson(res, 200, await wa.resetSession());
         }
 
         if (req.method === 'POST' && url.pathname === '/api/reschedule-overdue') {
@@ -570,19 +574,20 @@ pre { white-space: pre-wrap; background: #0b1f33; color: #d9eafd; border-radius:
       <span id="waPanelUser" style="color:var(--muted);font-size:13px"></span>
     </div>
     <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
-      <input id="waPhone" placeholder="Phone e.g. 2349010926847" style="height:36px;border:1px solid var(--line);border-radius:6px;padding:0 10px;width:200px">
-      <button class="primary" id="waPairBtn" onclick="waGetPairingCode()">Connect WhatsApp</button>
+      <button class="primary" id="waPairBtn" onclick="waInitQr()">Init / Show QR</button>
       <button class="danger" id="waDisconnectBtn" onclick="waDisconnect()" style="display:none">Disconnect</button>
+      <button id="waResetBtn" onclick="waResetSession()">Reset Session</button>
     </div>
     <div id="waPairCode" style="margin-top:10px;display:none">
       <div style="background:#fff8e5;border:1px solid #f5d37b;border-radius:8px;padding:16px;text-align:center">
-        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">On your phone, go to WhatsApp > <b>Linked Devices</b> > <b>Link a Device</b> > <b>Pair with Code</b></div>
-        <div id="waPairCodeDisplay" style="font-size:32px;font-weight:700;letter-spacing:8px;font-family:monospace;color:var(--text);padding:14px 20px;background:#fff;border:2px dashed var(--accent);border-radius:8px;display:inline-block"></div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:10px">On your phone, go to WhatsApp > <b>Linked Devices</b> > <b>Link a Device</b>, then scan this QR.</div>
+        <img id="waQrImage" alt="WhatsApp QR code" style="width:280px;max-width:100%;background:#fff;border:2px dashed var(--accent);border-radius:8px;padding:8px;display:none">
+        <div id="waPairCodeDisplay" style="font-size:14px;font-weight:700;font-family:monospace;color:var(--text);padding:14px 20px;background:#fff;border:2px dashed var(--accent);border-radius:8px;display:none"></div>
         <div id="waPairError" style="color:var(--bad);font-size:13px;margin-top:8px"></div>
-        <div style="font-size:12px;color:var(--muted);margin-top:6px">⏱ Code expires in 2 minutes</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px">QR refreshes automatically if WhatsApp sends a new one.</div>
       </div>
     </div>
-    <div id="waConnecting" style="margin-top:10px;display:none;padding:12px;background:#f1f5f9;border-radius:6px;text-align:center;color:var(--muted)">⏳ Connecting to WhatsApp servers... this may take up to 45 seconds</div>
+    <div id="waConnecting" style="margin-top:10px;display:none;padding:12px;background:#f1f5f9;border-radius:6px;text-align:center;color:var(--muted)">Connecting to WhatsApp Web... wait for QR or connected status.</div>
     <pre id="waOutput" style="margin-top:10px;max-height:100px;display:none"></pre>
   </div>
 
@@ -900,24 +905,34 @@ function updateWaPanel(status) {
     el.textContent = '✅ Connected';
     el.style.background = '#eefaf5'; el.style.color = 'var(--ok)';
     user.textContent = status.user || 'WhatsApp ready';
-    pairBtn.textContent = 'Reconnect';
+    pairBtn.textContent = 'Recheck / New QR';
     pairBtn.className = '';
     discBtn.style.display = '';
     if (pairDiv) pairDiv.style.display = 'none';
-  } else if (status.pairingCode) {
-    el.textContent = '🔐 Pairing Code Ready';
+  } else if (status.qrDataUrl || status.qr) {
+    el.textContent = 'QR Ready';
     el.style.background = '#fff8e5'; el.style.color = 'var(--warn)';
-    user.textContent = 'Enter code on your phone';
-    pairBtn.textContent = 'Connect WhatsApp';
+    user.textContent = 'Scan with WhatsApp Linked Devices';
+    pairBtn.textContent = 'Refresh QR';
     discBtn.style.display = '';
     pairDiv.style.display = 'block';
-    document.getElementById('waPairCodeDisplay').textContent = status.pairingCode;
+    const img = document.getElementById('waQrImage');
+    const code = document.getElementById('waPairCodeDisplay');
+    if (status.qrDataUrl) {
+      img.src = status.qrDataUrl;
+      img.style.display = 'inline-block';
+      code.style.display = 'none';
+    } else {
+      img.style.display = 'none';
+      code.style.display = 'inline-block';
+      code.textContent = status.qr || '';
+    }
     document.getElementById('waPairError').textContent = '';
   } else if (status.error) {
     el.textContent = '❌ Error';
     el.style.background = '#fff0ee'; el.style.color = 'var(--bad)';
     user.textContent = status.error;
-    pairBtn.textContent = 'Retry Connection';
+    pairBtn.textContent = 'Init / Show QR';
     pairBtn.className = 'primary';
     discBtn.style.display = 'none';
     if (pairDiv) pairDiv.style.display = 'none';
@@ -925,38 +940,28 @@ function updateWaPanel(status) {
     el.textContent = '○ Not connected';
     el.style.background = '#f1f5f9'; el.style.color = 'var(--muted)';
     user.textContent = '';
-    pairBtn.textContent = 'Connect WhatsApp';
+    pairBtn.textContent = status.status === 'initializing' ? 'Initializing...' : 'Init / Show QR';
     pairBtn.className = 'primary';
     discBtn.style.display = 'none';
     if (pairDiv) pairDiv.style.display = 'none';
   }
 }
 
-async function waGetPairingCode() {
-  const phone = document.getElementById('waPhone').value.trim();
+async function waInitQr() {
   const out = document.getElementById('waOutput');
   const connecting = document.getElementById('waConnecting');
   const pairDiv = document.getElementById('waPairCode');
   pairDiv.style.display = 'none';
   out.style.display = 'none';
 
-  if (!phone) {
-    out.style.display = 'block';
-    out.textContent = 'Please enter your phone number (e.g. 2349010926847)';
-    document.getElementById('waPanelStatus').textContent = '❌ Error';
-    document.getElementById('waPanelStatus').style.background = '#fff0ee';
-    document.getElementById('waPanelStatus').style.color = 'var(--bad)';
-    return;
-  }
-
   connecting.style.display = 'block';
-  document.getElementById('waPanelStatus').textContent = '⏳ Connecting...';
+  document.getElementById('waPanelStatus').textContent = 'Connecting...';
   document.getElementById('waPanelUser').textContent = '';
   try {
-    const result = await api('/api/wa/pair', { method: 'POST', body: JSON.stringify({ phone }) });
+    const result = await api('/api/wa/pair', { method: 'POST', body: JSON.stringify({}) });
     connecting.style.display = 'none';
     updateWaPanel(result);
-    if (result.pairingCode) {
+    if (result.qrDataUrl || result.connected) {
       out.style.display = 'none';
     } else if (result.error) {
       out.style.display = 'block';
@@ -967,6 +972,21 @@ async function waGetPairingCode() {
     out.style.display = 'block';
     out.textContent = 'Error: ' + e.message;
     updateWaPanel({ connected: false, pairingCode: null, error: e.message });
+  }
+}
+
+async function waResetSession() {
+  if (!confirm('Reset the saved WhatsApp Web session on this server? You will need to scan a fresh QR.')) return;
+  const out = document.getElementById('waOutput');
+  out.style.display = 'block';
+  out.textContent = 'Resetting session...';
+  try {
+    const result = await api('/api/wa/reset', { method: 'POST' });
+    out.textContent = 'Session reset. Click Init / Show QR.';
+    document.getElementById('waPairCode').style.display = 'none';
+    updateWaPanel(result);
+  } catch (e) {
+    out.textContent = 'Error: ' + e.message;
   }
 }
 

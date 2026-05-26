@@ -1,191 +1,245 @@
-const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
-const P = require('pino');
+const qrcode = require('qrcode');
 
-const DATA_DIR = path.join(__dirname, 'baileys-auth');
+const AUTH_DIR = path.join(__dirname, 'session-data', 'auth');
+const CLIENT_ID = 'forgegrowth';
+const MODERN_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-let sock = null;
-let isConnected = false;
+let client = null;
 let statusListeners = [];
-let pairingCodeInfo = null;
-let logger = P({ level: 'silent' });
-let socketReadyResolve = null;
-let socketReadyPromise = null;
+let state = {
+    connected: false,
+    status: 'not_started',
+    user: null,
+    error: null,
+    qr: null,
+    qrDataUrl: null,
+    checkedAt: null,
+    engine: 'whatsapp-web.js',
+    authPath: AUTH_DIR
+};
+
+function resolveChromePath() {
+    const candidates = [
+        process.env.CHROME_PATH,
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/google-chrome',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/snap/bin/chromium',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Users/MAC/.cache/puppeteer/chrome/mac_arm-147.0.7727.57/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
+    ].filter(Boolean);
+
+    return candidates.find(candidate => fs.existsSync(candidate)) || undefined;
+}
 
 function notifyListeners() {
-  const status = getStatus();
-  for (const fn of statusListeners) {
-    try { fn(status); } catch (e) { /* ignore */ }
-  }
+    const current = getStatus();
+    for (const fn of statusListeners) {
+        try { fn(current); } catch (_) {}
+    }
+}
+
+function patchState(patch) {
+    state = {
+        ...state,
+        ...patch,
+        checkedAt: new Date().toISOString()
+    };
+    notifyListeners();
+    return getStatus();
 }
 
 function getStatus() {
-  return {
-    connected: isConnected,
-    pairingCode: pairingCodeInfo ? pairingCodeInfo.code : null,
-    pairingPhone: pairingCodeInfo ? pairingCodeInfo.phone : null,
-    user: isConnected && sock ? (sock.user?.name || sock.user?.id || 'Connected') : null,
-    error: pairingCodeInfo ? pairingCodeInfo.error : null
-  };
+    return { ...state };
 }
 
 function onStatusChange(fn) {
-  statusListeners.push(fn);
-  return () => { statusListeners = statusListeners.filter(f => f !== fn); };
+    statusListeners.push(fn);
+    return () => { statusListeners = statusListeners.filter(listener => listener !== fn); };
+}
+
+function createClient() {
+    if (client) return client;
+
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    const executablePath = resolveChromePath();
+    const puppeteer = {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-extensions'
+        ]
+    };
+    if (executablePath) puppeteer.executablePath = executablePath;
+
+    client = new Client({
+        authStrategy: new LocalAuth({
+            dataPath: AUTH_DIR,
+            clientId: CLIENT_ID
+        }),
+        puppeteer,
+        userAgent: MODERN_UA,
+        takeoverOnConflict: false,
+        takeoverTimeoutMs: 0
+    });
+
+    client.on('qr', async (qr) => {
+        try {
+            const qrDataUrl = await qrcode.toDataURL(qr, { width: 360, margin: 2 });
+            patchState({
+                connected: false,
+                status: 'qr_ready',
+                qr,
+                qrDataUrl,
+                error: null,
+                user: null
+            });
+        } catch (error) {
+            patchState({
+                connected: false,
+                status: 'qr_error',
+                error: error.message,
+                qr,
+                qrDataUrl: null
+            });
+        }
+    });
+
+    client.on('authenticated', () => {
+        patchState({
+            connected: false,
+            status: 'authenticated',
+            error: null
+        });
+    });
+
+    client.on('ready', async () => {
+        let user = 'Connected';
+        try {
+            const info = await client.info;
+            user = `${info.pushname || 'WhatsApp'} (${info.wid?.user || info.me?.user || ''})`.trim();
+        } catch (_) {}
+
+        patchState({
+            connected: true,
+            status: 'connected',
+            user,
+            error: null,
+            qr: null,
+            qrDataUrl: null
+        });
+    });
+
+    client.on('auth_failure', (message) => {
+        patchState({
+            connected: false,
+            status: 'auth_failure',
+            error: `Auth failed: ${message || 're-auth needed'}`,
+            user: null
+        });
+    });
+
+    client.on('disconnected', (reason) => {
+        client = null;
+        patchState({
+            connected: false,
+            status: reason === 'LOGOUT' ? 'logged_out' : 'disconnected',
+            error: reason === 'LOGOUT' ? 'Logged out - scan QR again' : `Disconnected: ${reason}`,
+            user: null
+        });
+    });
+
+    return client;
 }
 
 async function init() {
-  if (sock) return getStatus();
+    if (state.connected) return getStatus();
+    if (client && ['initializing', 'qr_ready', 'authenticated'].includes(state.status)) return getStatus();
 
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(DATA_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-
-  socketReadyPromise = new Promise((resolve) => {
-    socketReadyResolve = resolve;
-  });
-
-  sock = makeWASocket({
-    version,
-    logger,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['Chrome (Forge Growth)', 'Linux', '131.0.0.0'],
-    markOnlineOnConnect: false,
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000,
-    syncFullHistory: false,
-    emitOwnEvents: true,
-  });
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr && !isConnected && !sock.authState.creds.registered) {
-      if (socketReadyResolve) {
-        socketReadyResolve();
-        socketReadyResolve = null;
-      }
-    }
-
-    if (connection === 'open') {
-      isConnected = true;
-      pairingCodeInfo = null;
-      if (socketReadyResolve) {
-        socketReadyResolve();
-        socketReadyResolve = null;
-      }
-      notifyListeners();
-    }
-
-    if (connection === 'close') {
-      isConnected = false;
-      const code = lastDisconnect?.error?.output?.statusCode;
-      if (code === DisconnectReason.loggedOut) {
-        pairingCodeInfo = { error: 'Logged out — re-auth needed' };
-        sock = null;
-      } else {
-        setTimeout(() => {
-          if (!isConnected && sock) {
-            sock.initialize().catch(() => {});
-          }
-        }, 5000);
-      }
-      notifyListeners();
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  if (sock.authState.creds.registered) {
-    isConnected = true;
-    if (socketReadyResolve) {
-      socketReadyResolve();
-      socketReadyResolve = null;
-    }
-    notifyListeners();
-  }
-
-  return getStatus();
-}
-
-async function requestPairingCode(phoneNumber) {
-  if (!sock) await init();
-
-  const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-  if (cleanPhone.length < 8) {
-    pairingCodeInfo = { error: 'Invalid phone number "' + phoneNumber + '" — enter your number with country code (e.g. 2349010926847)', phone: phoneNumber };
-    notifyListeners();
-    return getStatus();
-  }
-
-  if (!isConnected) {
-    try {
-      if (socketReadyPromise) {
-        await Promise.race([
-          socketReadyPromise,
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Connection to WhatsApp servers timed out after 45s. Check network or try again.')), 45000))
-        ]);
-      }
-    } catch (e) {
-      sock = null;
-      socketReadyPromise = null;
-      socketReadyResolve = null;
-      pairingCodeInfo = { error: e.message, phone: cleanPhone };
-      notifyListeners();
-      return getStatus();
-    }
-  }
-
-  try {
-    const code = await sock.requestPairingCode(cleanPhone);
-    const formatted = code.toString().match(/.{1,4}/g)?.join('-') || code.toString();
-    pairingCodeInfo = { code: formatted, phone: cleanPhone };
-    notifyListeners();
-
-    const timeout = setTimeout(() => {
-      if (pairingCodeInfo && pairingCodeInfo.code === formatted) {
-        pairingCodeInfo = { ...pairingCodeInfo, error: 'Pairing timed out — scan the code on your phone within 2 minutes' };
-        notifyListeners();
-      }
-    }, 120000);
-    const origUnsub = onStatusChange((s) => {
-      if (s.connected) { clearTimeout(timeout); origUnsub(); }
+    patchState({
+        connected: false,
+        status: 'initializing',
+        error: null,
+        qr: null,
+        qrDataUrl: null
     });
 
+    try {
+        createClient();
+        await client.initialize();
+    } catch (error) {
+        client = null;
+        patchState({
+            connected: false,
+            status: 'error',
+            error: error.message,
+            qr: null,
+            qrDataUrl: null
+        });
+    }
+
     return getStatus();
-  } catch (e) {
-    pairingCodeInfo = { error: 'Pairing request failed: ' + e.message, phone: cleanPhone };
-    notifyListeners();
-    return getStatus();
-  }
+}
+
+async function requestPairingCode() {
+    await init();
+    return {
+        ...getStatus(),
+        pairingCode: null,
+        pairingSupported: false,
+        pairingMessage: 'This sender uses WhatsApp Web session auth. Scan the QR code shown here; it creates the exact session used by the sender.'
+    };
 }
 
 async function disconnect() {
-  if (sock) {
+    if (client) {
+        try { await client.destroy(); } catch (_) {}
+        client = null;
+    }
+    return patchState({
+        connected: false,
+        status: 'stopped',
+        user: null,
+        error: null,
+        qr: null,
+        qrDataUrl: null
+    });
+}
+
+async function resetSession() {
+    await disconnect();
+    const sessionDir = path.join(AUTH_DIR, `session-${CLIENT_ID}`);
     try {
-      sock.end(new Error('User disconnected'));
-    } catch (e) { /* ignore */ }
-    sock = null;
-  }
-  isConnected = false;
-  pairingCodeInfo = null;
-  socketReadyPromise = null;
-  socketReadyResolve = null;
-  notifyListeners();
-  return getStatus();
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch (_) {}
+    return patchState({
+        connected: false,
+        status: 'reset',
+        user: null,
+        error: null,
+        qr: null,
+        qrDataUrl: null
+    });
 }
 
 async function shutdown() {
-  await disconnect();
-  statusListeners = [];
+    await disconnect();
+    statusListeners = [];
 }
 
-async function sendMessage(jid, text) {
-  if (!sock || !isConnected) throw new Error('WhatsApp not connected');
-  return sock.sendMessage(jid, { text });
-}
-
-module.exports = { init, getStatus, onStatusChange, requestPairingCode, disconnect, shutdown, sendMessage };
+module.exports = {
+    init,
+    getStatus,
+    onStatusChange,
+    requestPairingCode,
+    disconnect,
+    resetSession,
+    shutdown
+};
