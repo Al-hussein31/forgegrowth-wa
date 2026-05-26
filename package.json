@@ -1,0 +1,30 @@
+{
+  "name": "forgegrowth-wa",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "campaign:generate": "node generate_campaign.js",
+    "campaign:list": "node dm_sender.js --list",
+    "campaign:dry-test2": "node dm_sender.js --ids fgd-0001,fgd-0002 --ignore-time --max 2",
+    "campaign:reschedule": "node reschedule_overdue.js --write",
+    "dashboard": "node dashboard_server.js",
+    "campaign:runner": "node campaign_runner.js",
+    "wa:status": "node wa_status.js",
+    "wa:viewer": "node open_whatsapp_viewer.js",
+    "test": "node -c generate_campaign.js && node -c dm_sender.js && node -c wa_client.js && node -c catchup_sends.js && node -c dashboard_server.js && node -c wa_status.js && node -c open_whatsapp_viewer.js && node -c campaign_runner.js && node -c reschedule_overdue.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "pino": "^10.3.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.7"
+  }
+}

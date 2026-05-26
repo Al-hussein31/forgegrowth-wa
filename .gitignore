@@ -1,0 +1,15 @@
+node_modules/
+.wwebjs_cache/
+baileys-auth/
+baileys.js
+baileys_test.js
+session-data/
+*.log
+automation_state.json
+dm_sent_log.json
+dm_campaign.json
+forgegrowth_selection.json
+contacts_full_analysis.json
+analysis_output.json
+.wwebjs_authfile
+WhatsAppSession/
