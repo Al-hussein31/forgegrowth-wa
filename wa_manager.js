@@ -115,8 +115,8 @@ async function requestPairingCode(phoneNumber) {
   if (!sock) await init();
 
   const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-  if (cleanPhone.length < 10) {
-    pairingCodeInfo = { error: 'Invalid phone number (use e.g. 2349010926847)', phone: phoneNumber };
+  if (cleanPhone.length < 8) {
+    pairingCodeInfo = { error: 'Invalid phone number "' + phoneNumber + '" — enter your number with country code (e.g. 2349010926847)', phone: phoneNumber };
     notifyListeners();
     return getStatus();
   }

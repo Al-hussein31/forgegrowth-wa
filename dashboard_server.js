@@ -203,6 +203,20 @@ function publicItem(item) {
     };
 }
 
+function publicItemList(item) {
+    return {
+        id: item.id,
+        contact: { name: item.contact?.name, phone: item.contact?.phone, contactName: item.contact?.contactName },
+        analysis: item.analysis ? { businessType: item.analysis.businessType, strategy: item.analysis.strategy, tone: item.analysis.tone, relationship: item.analysis.relationship } : null,
+        dm: (item.dm || '').slice(0, 120),
+        sendAt: item.sendAt,
+        day: item.day,
+        status: item.status || 'pending',
+        reviewStatus: item.reviewStatus || 'needs_review',
+        ack: item.ack ?? null
+    };
+}
+
 function runSender(args) {
     return new Promise((resolve) => {
         const child = spawn(process.execPath, ['dm_sender.js', ...args], {
@@ -283,9 +297,17 @@ async function handleApi(req, res, url) {
             return sendJson(res, 200, {
                 summary: summarize(campaign, sentLog),
                 automation: loadAutomationState(),
-                schedule: campaign.schedule.map(publicItem),
+                schedule: campaign.schedule.map(publicItemList),
                 skippedContacts: campaign.skippedContacts || []
             });
+        }
+
+        if (req.method === 'GET' && url.pathname.startsWith('/api/message/')) {
+            const id = decodeURIComponent(url.pathname.split('/').pop());
+            const campaign = loadCampaign();
+            const item = campaign.schedule.find(entry => entry.id === id);
+            if (!item) return sendJson(res, 404, { error: 'Message not found' });
+            return sendJson(res, 200, publicItem(item));
         }
 
         if (req.method === 'GET' && url.pathname === '/api/automation/status') {
@@ -719,12 +741,18 @@ async function bulkReview(reviewStatus) {
   await loadCampaign();
 }
 
-function showDetail(id) {
+async function showDetail(id) {
   state.activeId = id;
-  const item = state.schedule.find(x => x.id === id);
-  if (!item) return;
-  document.getElementById('detail').innerHTML = detailHtml(item);
+  document.getElementById('detail').innerHTML = '<h2>Loading...</h2>';
   renderTable();
+  try {
+    const item = await api('/api/message/' + encodeURIComponent(id));
+    document.getElementById('detail').innerHTML = detailHtml(item);
+  } catch (e) {
+    const item = state.schedule.find(x => x.id === id);
+    if (item) document.getElementById('detail').innerHTML = detailHtml(item);
+    else document.getElementById('detail').innerHTML = '<h2>Error loading message</h2><p class="meta">' + e.message + '</p>';
+  }
 }
 
 function detailHtml(item) {
@@ -773,11 +801,13 @@ async function saveDm(id) {
   const dm = document.getElementById('dmText').value;
   await api('/api/messages/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ dm }) });
   await loadCampaign();
+  if (state.activeId) showDetail(state.activeId);
 }
 
 async function setReview(id, reviewStatus) {
   await api('/api/messages/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ reviewStatus }) });
   await loadCampaign();
+  if (state.activeId) showDetail(state.activeId);
 }
 
 async function dryRunSelected() {
@@ -892,6 +922,16 @@ async function waGetPairingCode() {
   const pairDiv = document.getElementById('waPairCode');
   pairDiv.style.display = 'none';
   out.style.display = 'none';
+
+  if (!phone) {
+    out.style.display = 'block';
+    out.textContent = 'Please enter your phone number (e.g. 2349010926847)';
+    document.getElementById('waPanelStatus').textContent = '❌ Error';
+    document.getElementById('waPanelStatus').style.background = '#fff0ee';
+    document.getElementById('waPanelStatus').style.color = 'var(--bad)';
+    return;
+  }
+
   connecting.style.display = 'block';
   document.getElementById('waPanelStatus').textContent = '⏳ Connecting...';
   document.getElementById('waPanelUser').textContent = '';
