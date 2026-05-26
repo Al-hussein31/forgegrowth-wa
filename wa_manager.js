@@ -116,21 +116,24 @@ async function requestPairingCode(phoneNumber) {
 
   const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
   if (cleanPhone.length < 10) {
-    pairingCodeInfo = { error: 'Invalid phone number', phone: phoneNumber };
+    pairingCodeInfo = { error: 'Invalid phone number (use e.g. 2349010926847)', phone: phoneNumber };
     notifyListeners();
     return getStatus();
   }
 
-  if (!sock.authState.creds.registered) {
+  if (!isConnected) {
     try {
       if (socketReadyPromise) {
         await Promise.race([
           socketReadyPromise,
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Socket connection timeout')), 30000))
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Connection to WhatsApp servers timed out after 45s. Check network or try again.')), 45000))
         ]);
       }
     } catch (e) {
-      pairingCodeInfo = { error: 'Connection timeout: ' + e.message, phone: cleanPhone };
+      sock = null;
+      socketReadyPromise = null;
+      socketReadyResolve = null;
+      pairingCodeInfo = { error: e.message, phone: cleanPhone };
       notifyListeners();
       return getStatus();
     }
@@ -144,7 +147,7 @@ async function requestPairingCode(phoneNumber) {
 
     const timeout = setTimeout(() => {
       if (pairingCodeInfo && pairingCodeInfo.code === formatted) {
-        pairingCodeInfo = { ...pairingCodeInfo, error: 'Pairing timed out' };
+        pairingCodeInfo = { ...pairingCodeInfo, error: 'Pairing timed out — scan the code on your phone within 2 minutes' };
         notifyListeners();
       }
     }, 120000);
@@ -154,7 +157,7 @@ async function requestPairingCode(phoneNumber) {
 
     return getStatus();
   } catch (e) {
-    pairingCodeInfo = { error: e.message, phone: cleanPhone };
+    pairingCodeInfo = { error: 'Pairing request failed: ' + e.message, phone: cleanPhone };
     notifyListeners();
     return getStatus();
   }

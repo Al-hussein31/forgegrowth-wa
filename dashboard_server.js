@@ -26,7 +26,7 @@ function writeJsonAtomic(filePath, data) {
 function loadCampaign() {
     const campaign = readJson(CAMPAIGN, null);
     if (!campaign || !Array.isArray(campaign.schedule)) {
-        throw new Error('dm_campaign.json is missing or invalid');
+        return { version: 1, generatedAt: null, objective: '', total: 0, skipped: 0, days: 0, startDate: null, endDate: null, schedule: [] };
     }
     let changed = false;
     for (const item of campaign.schedule) {
@@ -527,23 +527,23 @@ pre { white-space: pre-wrap; background: #0b1f33; color: #d9eafd; border-radius:
   <div id="waPanel" style="display:none;padding:12px 18px;background:#fff;border-bottom:1px solid var(--line)">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <b>WhatsApp Connection</b>
-      <span id="waPanelStatus" class="pill" style="background:#eefaf5;color:var(--ok)">Unknown</span>
+      <span id="waPanelStatus" class="pill" style="background:#f1f5f9;color:var(--muted)">Unknown</span>
       <span id="waPanelUser" style="color:var(--muted);font-size:13px"></span>
     </div>
     <div style="display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap">
       <input id="waPhone" placeholder="Phone e.g. 2349010926847" style="height:36px;border:1px solid var(--line);border-radius:6px;padding:0 10px;width:200px">
-      <button onclick="waConnect()">Init Connection</button>
-      <button class="primary" onclick="waGetPairingCode()">Get Pairing Code</button>
-      <button class="danger" onclick="waDisconnect()">Disconnect</button>
+      <button class="primary" id="waPairBtn" onclick="waGetPairingCode()">Connect WhatsApp</button>
+      <button class="danger" id="waDisconnectBtn" onclick="waDisconnect()" style="display:none">Disconnect</button>
     </div>
     <div id="waPairCode" style="margin-top:10px;display:none">
       <div style="background:#fff8e5;border:1px solid #f5d37b;border-radius:8px;padding:16px;text-align:center">
-        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">On your phone, go to WhatsApp > Linked Devices > Link a Device > <b>Pair with Code</b></div>
-        <div id="waPairCodeDisplay" style="font-size:28px;font-weight:700;letter-spacing:6px;font-family:monospace;color:var(--text);padding:12px;background:#fff;border-radius:6px;display:inline-block"></div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:6px">On your phone, go to WhatsApp > <b>Linked Devices</b> > <b>Link a Device</b> > <b>Pair with Code</b></div>
+        <div id="waPairCodeDisplay" style="font-size:32px;font-weight:700;letter-spacing:8px;font-family:monospace;color:var(--text);padding:14px 20px;background:#fff;border:2px dashed var(--accent);border-radius:8px;display:inline-block"></div>
         <div id="waPairError" style="color:var(--bad);font-size:13px;margin-top:8px"></div>
-        <div style="font-size:12px;color:var(--muted);margin-top:6px">Code expires in 2 minutes</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px">⏱ Code expires in 2 minutes</div>
       </div>
     </div>
+    <div id="waConnecting" style="margin-top:10px;display:none;padding:12px;background:#f1f5f9;border-radius:6px;text-align:center;color:var(--muted)">⏳ Connecting to WhatsApp servers... this may take up to 45 seconds</div>
     <pre id="waOutput" style="margin-top:10px;max-height:100px;display:none"></pre>
   </div>
 
@@ -582,10 +582,16 @@ async function api(path, options) {
 
 async function loadCampaign() {
   if (document.activeElement && document.activeElement.id === 'dmText') return;
-  const data = await api('/api/campaign');
-  state.schedule = data.schedule;
-  state.summary = data.summary;
-  state.automation = data.automation;
+  try {
+    const data = await api('/api/campaign');
+    state.schedule = data.schedule || [];
+    state.summary = data.summary || null;
+    state.automation = data.automation || null;
+  } catch (e) {
+    state.schedule = [];
+    state.summary = null;
+    state.automation = null;
+  }
   state.lastLoadedAt = new Date();
   buildBusinessFilter();
   renderStats();
@@ -602,18 +608,20 @@ async function refreshCampaignLive() {
   }
   try {
     const data = await api('/api/campaign');
-    state.schedule = data.schedule;
-    state.summary = data.summary;
-    state.automation = data.automation;
-    state.lastLoadedAt = new Date();
-    buildBusinessFilter();
-    renderStats();
-    renderTable();
-    if (state.activeId) showDetail(state.activeId);
-    updateLiveMeta();
+    state.schedule = data.schedule || [];
+    state.summary = data.summary || null;
+    state.automation = data.automation || null;
   } catch (e) {
-    updateLiveMeta('update error');
+    state.schedule = [];
+    state.summary = null;
+    state.automation = null;
   }
+  state.lastLoadedAt = new Date();
+  buildBusinessFilter();
+  renderStats();
+  renderTable();
+  if (state.activeId) showDetail(state.activeId);
+  updateLiveMeta();
 }
 
 function updateLiveMeta(extra) {
@@ -835,64 +843,85 @@ function toggleWaPanel() {
 function updateWaPanel(status) {
   const el = document.getElementById('waPanelStatus');
   const user = document.getElementById('waPanelUser');
+  const pairBtn = document.getElementById('waPairBtn');
+  const discBtn = document.getElementById('waDisconnectBtn');
+  const pairDiv = document.getElementById('waPairCode');
+  const connecting = document.getElementById('waConnecting');
   if (!el) return;
+  connecting.style.display = 'none';
   if (status.connected) {
-    el.textContent = 'Connected';
+    el.textContent = '✅ Connected';
     el.style.background = '#eefaf5'; el.style.color = 'var(--ok)';
-    user.textContent = status.user || '';
+    user.textContent = status.user || 'WhatsApp ready';
+    pairBtn.textContent = 'Reconnect';
+    pairBtn.className = '';
+    discBtn.style.display = '';
+    if (pairDiv) pairDiv.style.display = 'none';
   } else if (status.pairingCode) {
-    el.textContent = 'Pairing...';
+    el.textContent = '🔐 Pairing Code Ready';
     el.style.background = '#fff8e5'; el.style.color = 'var(--warn)';
-    user.textContent = '';
-    document.getElementById('waPairCode').style.display = 'block';
+    user.textContent = 'Enter code on your phone';
+    pairBtn.textContent = 'Connect WhatsApp';
+    discBtn.style.display = '';
+    pairDiv.style.display = 'block';
     document.getElementById('waPairCodeDisplay').textContent = status.pairingCode;
     document.getElementById('waPairError').textContent = '';
   } else if (status.error) {
-    el.textContent = 'Error';
+    el.textContent = '❌ Error';
     el.style.background = '#fff0ee'; el.style.color = 'var(--bad)';
     user.textContent = status.error;
+    pairBtn.textContent = 'Retry Connection';
+    pairBtn.className = 'primary';
+    discBtn.style.display = 'none';
+    if (pairDiv) pairDiv.style.display = 'none';
   } else {
-    el.textContent = 'Not connected';
+    el.textContent = '○ Not connected';
     el.style.background = '#f1f5f9'; el.style.color = 'var(--muted)';
     user.textContent = '';
-  }
-}
-
-async function waConnect() {
-  const out = document.getElementById('waOutput');
-  out.style.display = 'block';
-  out.textContent = 'Initializing WhatsApp connection...';
-  try {
-    const result = await api('/api/wa/connect', { method: 'POST' });
-    out.textContent = JSON.stringify(result, null, 2);
-    updateWaPanel(result);
-  } catch (e) {
-    out.textContent = 'Error: ' + e.message;
+    pairBtn.textContent = 'Connect WhatsApp';
+    pairBtn.className = 'primary';
+    discBtn.style.display = 'none';
+    if (pairDiv) pairDiv.style.display = 'none';
   }
 }
 
 async function waGetPairingCode() {
   const phone = document.getElementById('waPhone').value.trim();
   const out = document.getElementById('waOutput');
-  document.getElementById('waPairCode').style.display = 'none';
-  out.style.display = 'block';
-  out.textContent = 'Requesting pairing code...';
+  const connecting = document.getElementById('waConnecting');
+  const pairDiv = document.getElementById('waPairCode');
+  pairDiv.style.display = 'none';
+  out.style.display = 'none';
+  connecting.style.display = 'block';
+  document.getElementById('waPanelStatus').textContent = '⏳ Connecting...';
+  document.getElementById('waPanelUser').textContent = '';
   try {
     const result = await api('/api/wa/pair', { method: 'POST', body: JSON.stringify({ phone }) });
-    out.textContent = JSON.stringify(result, null, 2);
+    connecting.style.display = 'none';
     updateWaPanel(result);
+    if (result.pairingCode) {
+      out.style.display = 'none';
+    } else if (result.error) {
+      out.style.display = 'block';
+      out.textContent = 'Error: ' + result.error;
+    }
   } catch (e) {
+    connecting.style.display = 'none';
+    out.style.display = 'block';
     out.textContent = 'Error: ' + e.message;
+    updateWaPanel({ connected: false, pairingCode: null, error: e.message });
   }
 }
 
 async function waDisconnect() {
   const out = document.getElementById('waOutput');
+  const connecting = document.getElementById('waConnecting');
+  connecting.style.display = 'none';
   out.style.display = 'block';
   out.textContent = 'Disconnecting...';
   try {
     const result = await api('/api/wa/disconnect', { method: 'POST' });
-    out.textContent = JSON.stringify(result, null, 2);
+    out.textContent = 'Disconnected';
     document.getElementById('waPairCode').style.display = 'none';
     updateWaPanel(result);
   } catch (e) {
