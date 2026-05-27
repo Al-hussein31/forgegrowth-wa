@@ -1,5 +1,4 @@
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode');
@@ -116,7 +115,7 @@ async function createSocket() {
         }
 
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error ? Boom(lastDisconnect.error)?.output?.statusCode : null;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
 
             if (statusCode === DisconnectReason.restartRequired) {
                 patchState({

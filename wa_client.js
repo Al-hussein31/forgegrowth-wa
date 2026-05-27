@@ -1,5 +1,4 @@
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
 const path = require('path');
 const fs = require('fs');
 const pino = require('pino');
@@ -43,7 +42,7 @@ async function init() {
         }
 
         if (connection === 'close') {
-            const reason = lastDisconnect?.error ? Boom(lastDisconnect.error)?.output?.statusCode : null;
+            const reason = lastDisconnect?.error?.output?.statusCode;
 
             if (reason === DisconnectReason.restartRequired) {
                 isReady = false;
