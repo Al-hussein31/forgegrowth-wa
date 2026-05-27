@@ -5,7 +5,7 @@ const { spawn } = require('child_process');
 const ROOT = __dirname;
 const STATE_FILE = path.join(ROOT, 'automation_state.json');
 const LOG_FILE = path.join(ROOT, 'automation_runner.log');
-const INTERVAL_MS = Number(process.env.RUNNER_INTERVAL_MS || 60_000);
+const INTERVAL_MS = Number(process.env.RUNNER_INTERVAL_MS || 300_000);
 
 let stopping = false;
 
@@ -47,22 +47,8 @@ function runSenderOnce() {
             '--send',
             '--real-send-approved',
             '--max',
-            '1'
+            '5'
         ], {
-            cwd: ROOT,
-            env: process.env
-        });
-
-        let output = '';
-        child.stdout.on('data', chunk => { output += chunk.toString(); });
-        child.stderr.on('data', chunk => { output += chunk.toString(); });
-        child.on('close', code => resolve({ code, output }));
-    });
-}
-
-function rescheduleOverdue() {
-    return new Promise(resolve => {
-        const child = spawn(process.execPath, ['reschedule_overdue.js', '--write'], {
             cwd: ROOT,
             env: process.env
         });
@@ -93,14 +79,11 @@ async function loop() {
             appendLog('sender cycle starting');
             const result = await runSenderOnce();
             appendLog(`sender cycle finished code=${result.code}`);
-            const rescheduleResult = await rescheduleOverdue();
-            appendLog(`reschedule cycle finished code=${rescheduleResult.code} output=${rescheduleResult.output.trim().slice(0, 300)}`);
             statePatch({
                 status: 'running',
                 lastRunAt: new Date().toISOString(),
                 lastExitCode: result.code,
                 lastOutput: result.output.slice(-5000),
-                lastRescheduleOutput: rescheduleResult.output.slice(-2000),
                 lastError: result.code === 0 ? null : `dm_sender exited with ${result.code}`
             });
         } catch (error) {

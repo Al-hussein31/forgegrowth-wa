@@ -1,269 +1,130 @@
-/**
- * wa_client.js — Robust WhatsApp Web client with persistent sessions.
- * 
- * Fixes:
- *  - Uses realistic user agent (matches actual Chrome version)
- *  - Persistent LocalAuth (never wipes session unless asked)
- *  - Auto-reconnect on disconnect
- *  - Proper ACK tracking with retries
- *  - Single reusable client instance
- */
-
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const path = require('path');
 const fs = require('fs');
+const pino = require('pino');
 
-const DATA_DIR = path.join(__dirname, 'session-data');
-const AUTH_DIR = path.join(DATA_DIR, 'auth');
+const AUTH_DIR = path.join(__dirname, 'session-data', 'baileys-auth');
 
-function resolveChromePath() {
-    const candidates = [
-        process.env.CHROME_PATH,
-        '/usr/bin/google-chrome-stable',
-        '/usr/bin/google-chrome',
-        '/usr/bin/chromium-browser',
-        '/usr/bin/chromium',
-        '/snap/bin/chromium',
-        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        '/Users/MAC/.cache/puppeteer/chrome/mac_arm-147.0.7727.57/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
-    ].filter(Boolean);
-    return candidates.find(candidate => fs.existsSync(candidate));
-}
-
-// Modern user agent matching actual Chrome 147 on macOS Sequoia
-const MODERN_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36';
-
-let client = null;
+let sock = null;
 let isReady = false;
-let pendingSends = [];
 
-function createClient() {
-    if (client) return client;
+async function init() {
+    if (sock) {
+        if (isReady) return true;
+        return ensureConnection();
+    }
 
-    console.log('Initializing WhatsApp client...');
-    
-    const executablePath = resolveChromePath();
-    const puppeteer = { 
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-        ]
-    };
-    if (executablePath) puppeteer.executablePath = executablePath;
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
 
-    client = new Client({
-        authStrategy: new LocalAuth({ 
-            dataPath: AUTH_DIR,
-            clientId: 'forgegrowth' // stable client ID
-        }),
-        puppeteer,
-        userAgent: MODERN_UA,
-        takeoverOnConflict: true,
-        takeoverTimeoutMs: 0,
+    const logger = pino({ level: 'warn' });
+
+    sock = makeWASocket({
+        version,
+        auth: state,
+        logger,
+        markOnlineOnConnect: true,
+        syncFullHistory: false,
+        browser: Browsers.macOS('ForgeGrowthSender')
     });
 
-    client.on('qr', (qr) => {
-        console.log('\n⚠️  QR CODE NEEDED — Scan required!');
-        console.log('   Open WhatsApp > Linked Devices > Link a Device\n');
-        isReady = false;
-    });
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-    client.on('authenticated', () => {
-        console.log('✅ Authenticated');
-    });
-
-    client.on('auth_failure', (msg) => {
-        console.error('❌ Auth failure:', msg);
-        isReady = false;
-    });
-
-    client.on('loading_screen', (percent, msg) => {
-        if (percent < 100) console.log(`Loading: ${percent}%`);
-    });
-
-    client.on('ready', async () => {
-        isReady = true;
-        const info = await client.info;
-        console.log(`\n✅ WhatsApp READY`);
-        console.log(`   Account: ${info.pushname} (${info.me.user})`);
-        console.log(`   Platform: ${info.platform}`);
-        console.log(`   Session: ${AUTH_DIR}\n`);
-
-        // Flush any pending sends
-        for (const send of pendingSends) {
-            await sendMessage(send.to, send.body);
+        if (qr) {
+            console.log('\n⚠️  QR CODE RECEIVED — Scan required from dashboard');
         }
-        pendingSends = [];
-    });
 
-    client.on('disconnected', async (reason) => {
-        console.log(`⚠️  Disconnected: ${reason}`);
-        isReady = false;
-        
-        if (reason === 'NAVIGATION' || reason === 'LOGOUT') {
-            console.log('Session invalid — will need re-auth');
-        } else {
-            // Try to reconnect
-            console.log('Attempting reconnect in 5s...');
-            await new Promise(r => setTimeout(r, 5000));
-            if (!isReady) {
-                try {
-                    await client.initialize();
-                } catch(e) {
-                    console.error('Reconnect failed:', e.message);
-                }
+        if (connection === 'open') {
+            isReady = true;
+            console.log('✅ WhatsApp READY');
+        }
+
+        if (connection === 'close') {
+            const reason = lastDisconnect?.error ? Boom(lastDisconnect.error)?.output?.statusCode : null;
+
+            if (reason === DisconnectReason.restartRequired) {
+                isReady = false;
+                sock = null;
+                return;
+            }
+
+            isReady = false;
+            sock = null;
+            if (reason === DisconnectReason.loggedOut) {
+                console.log('Session invalid — QR re-auth needed');
+            } else {
+                console.log('Disconnected');
             }
         }
     });
 
-    client.on('message_ack', (msg, ack) => {
-        const ackNames = ['PENDING', 'SENT', 'DELIVERED', 'READ', 'PLAYED'];
-        console.log(`📨 ACK update: ${msg.id._serialized.substring(0, 30)} → ${ackNames[ack] || ack}`);
-    });
+    sock.ev.on('creds.update', saveCreds);
 
-    return client;
+    return ensureConnection();
 }
 
-/**
- * Send a message with retry logic and ACK verification.
- */
+async function ensureConnection() {
+    if (isReady) return true;
+    if (!sock) return false;
+
+    return new Promise((resolve) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+            if (!settled) { settled = true; resolve(false); }
+        }, 90000);
+
+        const handler = (update) => {
+            if (settled) return;
+            if (update.connection === 'open') {
+                settled = true;
+                clearTimeout(timeout);
+                sock.ev.off('connection.update', handler);
+                resolve(true);
+            }
+            if (update.connection === 'close') {
+                settled = true;
+                clearTimeout(timeout);
+                sock.ev.off('connection.update', handler);
+                resolve(false);
+            }
+        };
+        sock.ev.on('connection.update', handler);
+    });
+}
+
 async function sendMessage(to, body, maxRetries = 2) {
-    if (!client || !isReady) {
-        throw new Error('WhatsApp not ready');
-    }
+    if (!sock || !isReady) throw new Error('WhatsApp not ready');
 
     let lastError;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
-            const result = await client.sendMessage(to, body);
-            const ackFromEvent = await waitForMessageAck(result, 8000);
-            
-            if (ackFromEvent !== null) {
-                result.ack = Math.max(result.ack || 0, ackFromEvent);
-            }
-
-            if (result.ack >= 1) {
-                console.log(`✅ Sent to ${to} (ACK: ${result.ack})`);
-                return result;
-            } else {
-                console.log(`⚠️  ACK still ${result.ack} after 8s — caller should keep this pending`);
-                return result;
-            }
-        } catch(e) {
+            const result = await sock.sendMessage(to, { text: body });
+            return {
+                ack: result?.status || 1,
+                id: {
+                    _serialized: result?.key?.id,
+                    id: result?.key?.id
+                }
+            };
+        } catch (e) {
             lastError = e;
-            console.log(`⚠️  Attempt ${attempt + 1} failed: ${e.message}`);
             if (attempt < maxRetries) {
                 await new Promise(r => setTimeout(r, 3000 * (attempt + 1)));
             }
         }
     }
-
     throw lastError;
 }
 
-function waitForMessageAck(message, timeoutMs) {
-    const id = message?.id?._serialized;
-    if (!id) {
-        return new Promise(resolve => setTimeout(() => resolve(null), timeoutMs));
-    }
-
-    return new Promise(resolve => {
-        const timeout = setTimeout(() => {
-            client.removeListener('message_ack', handler);
-            resolve(null);
-        }, timeoutMs);
-
-        const handler = (msg, ack) => {
-            if (msg?.id?._serialized !== id) return;
-            if (ack < 1) return;
-            clearTimeout(timeout);
-            client.removeListener('message_ack', handler);
-            resolve(ack);
-        };
-
-        client.on('message_ack', handler);
-    });
-}
-
-/**
- * Ensure client is connected. Returns false if QR scan needed.
- */
-async function ensureConnection() {
-    if (isReady) return true;
-
-    if (!client) {
-        createClient();
-    }
-
-    return new Promise((resolve) => {
-        let settled = false;
-        let sawQr = false;
-
-        const finish = (value) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeout);
-            client.removeListener('ready', readyHandler);
-            client.removeListener('qr', qrHandler);
-            client.removeListener('auth_failure', authFailureHandler);
-            resolve(value);
-        };
-
-        const timeout = setTimeout(() => {
-            if (sawQr) console.log('QR was requested and WhatsApp did not become ready before timeout.');
-            finish(false);
-        }, 90000);
-
-        const readyHandler = async () => {
-            finish(true);
-        };
-
-        const qrHandler = () => {
-            sawQr = true;
-            console.log('QR event received; still waiting briefly in case existing auth completes...');
-        };
-
-        const authFailureHandler = () => {
-            finish(false);
-        };
-
-        if (isReady) {
-            finish(true);
-            return;
-        }
-
-        client.once('ready', readyHandler);
-        client.on('qr', qrHandler);
-        client.once('auth_failure', authFailureHandler);
-
-        client.initialize().catch(e => {
-            console.error('Init error:', e.message);
-            finish(false);
-        });
-    });
-}
-
-/**
- * Initialize once (call at startup).
- */
-async function init() {
-    createClient();
-    return ensureConnection();
-}
-
-/**
- * Clean shutdown.
- */
 async function shutdown() {
-    if (client) {
-        try {
-            await client.destroy();
-        } catch(e) {}
-        client = null;
+    if (sock) {
+        sock.end(undefined);
+        sock = null;
         isReady = false;
     }
 }
 
-module.exports = { init, sendMessage, ensureConnection, shutdown, createClient };
+module.exports = { init, sendMessage, ensureConnection, shutdown };

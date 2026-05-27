@@ -585,6 +585,14 @@ pre { white-space: pre-wrap; background: #0b1f33; color: #d9eafd; border-radius:
         <div id="waPairCodeDisplay" style="font-size:14px;font-weight:700;font-family:monospace;color:var(--text);padding:14px 20px;background:#fff;border:2px dashed var(--accent);border-radius:8px;display:none"></div>
         <div id="waPairError" style="color:var(--bad);font-size:13px;margin-top:8px"></div>
         <div style="font-size:12px;color:var(--muted);margin-top:6px">QR refreshes automatically if WhatsApp sends a new one.</div>
+        <div style="margin-top:14px;padding-top:14px;border-top:1px dashed #f5d37b">
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px"><b>OR</b> — use pairing code instead (more reliable)</div>
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <input id="waPhoneInput" placeholder="2349010926847" style="width:200px;height:36px;border:1px solid var(--line);border-radius:6px;padding:0 10px;font-size:14px;text-align:center">
+            <button onclick="waPairWithCode()">Pair with Code</button>
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px">Enter your WhatsApp number with country code (no + or spaces)</div>
+        </div>
       </div>
     </div>
     <div id="waConnecting" style="margin-top:10px;display:none;padding:12px;background:#f1f5f9;border-radius:6px;text-align:center;color:var(--muted)">Connecting to WhatsApp Web... wait for QR or connected status.</div>
@@ -909,6 +917,19 @@ function updateWaPanel(status) {
     pairBtn.className = '';
     discBtn.style.display = '';
     if (pairDiv) pairDiv.style.display = 'none';
+  } else if (status.pairingCode) {
+    el.textContent = '🔑 Pairing Code Ready';
+    el.style.background = '#eefaf5'; el.style.color = '#0f8b8d';
+    user.textContent = 'Enter this code in WhatsApp > Linked Devices > Link a Device';
+    pairBtn.textContent = 'Refresh QR';
+    discBtn.style.display = '';
+    pairDiv.style.display = 'block';
+    const img = document.getElementById('waQrImage');
+    const code = document.getElementById('waPairCodeDisplay');
+    img.style.display = 'none';
+    code.style.display = 'inline-block';
+    code.textContent = status.pairingCode;
+    document.getElementById('waPairError').textContent = '';
   } else if (status.qrDataUrl || status.qr) {
     el.textContent = 'QR Ready';
     el.style.background = '#fff8e5'; el.style.color = 'var(--warn)';
@@ -947,6 +968,40 @@ function updateWaPanel(status) {
   }
 }
 
+async function waPairWithCode() {
+  const phone = document.getElementById('waPhoneInput').value.trim();
+  if (!phone) { alert('Enter your WhatsApp phone number (country code + number, no + or spaces)'); return; }
+  const out = document.getElementById('waOutput');
+  const connecting = document.getElementById('waConnecting');
+  const pairDiv = document.getElementById('waPairCode');
+  out.style.display = 'none';
+  connecting.style.display = 'block';
+  document.getElementById('waPanelStatus').textContent = 'Requesting pairing code...';
+  try {
+    const result = await api('/api/wa/pair', { method: 'POST', body: JSON.stringify({ phone }) });
+    connecting.style.display = 'none';
+    updateWaPanel(result);
+    if (result.pairingCode) {
+      document.getElementById('waPairCodeDisplay').textContent = result.pairingCode;
+      document.getElementById('waPairCodeDisplay').style.display = 'inline-block';
+      document.getElementById('waQrImage').style.display = 'none';
+      document.getElementById('waPairError').textContent = '';
+      pairDiv.style.display = 'block';
+      out.style.display = 'none';
+    } else if (result.error) {
+      out.style.display = 'block';
+      out.textContent = 'Error: ' + result.error;
+    } else {
+      out.style.display = 'block';
+      out.textContent = 'No pairing code received. Try QR instead.';
+    }
+  } catch (e) {
+    connecting.style.display = 'none';
+    out.style.display = 'block';
+    out.textContent = 'Error: ' + e.message;
+  }
+}
+
 async function waInitQr() {
   const out = document.getElementById('waOutput');
   const connecting = document.getElementById('waConnecting');
@@ -961,7 +1016,7 @@ async function waInitQr() {
     const result = await api('/api/wa/pair', { method: 'POST', body: JSON.stringify({}) });
     connecting.style.display = 'none';
     updateWaPanel(result);
-    if (result.qrDataUrl || result.connected) {
+    if (result.qrDataUrl || result.connected || result.pairingCode) {
       out.style.display = 'none';
     } else if (result.error) {
       out.style.display = 'block';

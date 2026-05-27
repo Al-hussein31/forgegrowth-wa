@@ -1,13 +1,13 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode');
+const pino = require('pino');
 
-const AUTH_DIR = path.join(__dirname, 'session-data', 'auth');
-const CLIENT_ID = 'forgegrowth';
-const MODERN_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const AUTH_DIR = path.join(__dirname, 'session-data', 'baileys-auth');
 
-let client = null;
+let sock = null;
 let statusListeners = [];
 let state = {
     connected: false,
@@ -16,25 +16,13 @@ let state = {
     error: null,
     qr: null,
     qrDataUrl: null,
+    pairingCode: null,
     checkedAt: null,
-    engine: 'whatsapp-web.js',
+    engine: 'baileys',
     authPath: AUTH_DIR
 };
 
-function resolveChromePath() {
-    const candidates = [
-        process.env.CHROME_PATH,
-        '/usr/bin/google-chrome-stable',
-        '/usr/bin/google-chrome',
-        '/usr/bin/chromium-browser',
-        '/usr/bin/chromium',
-        '/snap/bin/chromium',
-        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-        '/Users/MAC/.cache/puppeteer/chrome/mac_arm-147.0.7727.57/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'
-    ].filter(Boolean);
-
-    return candidates.find(candidate => fs.existsSync(candidate)) || undefined;
-}
+let saveCreds = null;
 
 function notifyListeners() {
     const current = getStatus();
@@ -44,11 +32,7 @@ function notifyListeners() {
 }
 
 function patchState(patch) {
-    state = {
-        ...state,
-        ...patch,
-        checkedAt: new Date().toISOString()
-    };
+    state = { ...state, ...patch, checkedAt: new Date().toISOString() };
     notifyListeners();
     return getStatus();
 }
@@ -59,123 +43,137 @@ function getStatus() {
 
 function onStatusChange(fn) {
     statusListeners.push(fn);
-    return () => { statusListeners = statusListeners.filter(listener => listener !== fn); };
+    return () => { statusListeners = statusListeners.filter(l => l !== fn); };
 }
 
-function createClient() {
-    if (client) return client;
+async function createSocket() {
+    if (sock) {
+        try { sock.end(undefined); } catch (_) {}
+        sock = null;
+    }
 
     fs.mkdirSync(AUTH_DIR, { recursive: true });
-    const executablePath = resolveChromePath();
-    const puppeteer = {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-extensions'
-        ]
-    };
-    if (executablePath) puppeteer.executablePath = executablePath;
+    const authState = await useMultiFileAuthState(AUTH_DIR);
+    saveCreds = authState.saveCreds;
+    const { version } = await fetchLatestBaileysVersion();
 
-    client = new Client({
-        authStrategy: new LocalAuth({
-            dataPath: AUTH_DIR,
-            clientId: CLIENT_ID
-        }),
-        puppeteer,
-        userAgent: MODERN_UA,
-        takeoverOnConflict: false,
-        takeoverTimeoutMs: 0
+    const logger = pino({ level: 'warn' });
+
+    sock = makeWASocket({
+        version,
+        auth: authState.state,
+        logger,
+        markOnlineOnConnect: true,
+        syncFullHistory: false,
+        browser: Browsers.macOS('ForgeGrowth')
     });
 
-    client.on('qr', async (qr) => {
-        try {
-            const qrDataUrl = await qrcode.toDataURL(qr, { width: 360, margin: 2 });
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            try {
+                const qrDataUrl = await qrcode.toDataURL(qr, { width: 360, margin: 2 });
+                patchState({
+                    connected: false,
+                    status: 'qr_ready',
+                    qr,
+                    qrDataUrl,
+                    pairingCode: null,
+                    error: null,
+                    user: null
+                });
+            } catch (err) {
+                patchState({
+                    connected: false,
+                    status: 'qr_error',
+                    error: err.message,
+                    qr,
+                    qrDataUrl: null
+                });
+            }
+        }
+
+        if (connection === 'open') {
+            let user = 'Connected';
+            try {
+                const creds = sock?.authState?.creds;
+                if (creds?.me) {
+                    const name = creds.me.name || 'WhatsApp';
+                    const id = (creds.me.id || '').split('@')[0] || '';
+                    user = `${name} (${id})`.trim();
+                }
+            } catch (_) {}
             patchState({
-                connected: false,
-                status: 'qr_ready',
-                qr,
-                qrDataUrl,
+                connected: true,
+                status: 'connected',
+                user,
                 error: null,
-                user: null
+                qr: null,
+                qrDataUrl: null,
+                pairingCode: null
             });
-        } catch (error) {
-            patchState({
-                connected: false,
-                status: 'qr_error',
-                error: error.message,
-                qr,
-                qrDataUrl: null
-            });
+        }
+
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error ? Boom(lastDisconnect.error)?.output?.statusCode : null;
+
+            if (statusCode === DisconnectReason.restartRequired) {
+                patchState({
+                    connected: false,
+                    status: 'reconnecting',
+                    error: null,
+                    qr: null,
+                    qrDataUrl: null
+                });
+                setTimeout(() => {
+                    createSocket().catch(() => {});
+                }, 500);
+                return;
+            }
+
+            const wasConnected = state.connected;
+            sock = null;
+            if (statusCode === DisconnectReason.loggedOut) {
+                patchState({
+                    connected: false,
+                    status: 'logged_out',
+                    error: 'Logged out — scan QR again',
+                    user: null
+                });
+            } else {
+                patchState({
+                    connected: false,
+                    status: wasConnected ? 'disconnected' : 'error',
+                    error: wasConnected ? 'Disconnected' : 'Connection closed',
+                    user: null
+                });
+            }
         }
     });
 
-    client.on('authenticated', () => {
-        patchState({
-            connected: false,
-            status: 'authenticated',
-            error: null
-        });
-    });
+    sock.ev.on('creds.update', saveCreds);
 
-    client.on('ready', async () => {
-        let user = 'Connected';
-        try {
-            const info = await client.info;
-            user = `${info.pushname || 'WhatsApp'} (${info.wid?.user || info.me?.user || ''})`.trim();
-        } catch (_) {}
-
-        patchState({
-            connected: true,
-            status: 'connected',
-            user,
-            error: null,
-            qr: null,
-            qrDataUrl: null
-        });
-    });
-
-    client.on('auth_failure', (message) => {
-        patchState({
-            connected: false,
-            status: 'auth_failure',
-            error: `Auth failed: ${message || 're-auth needed'}`,
-            user: null
-        });
-    });
-
-    client.on('disconnected', (reason) => {
-        client = null;
-        patchState({
-            connected: false,
-            status: reason === 'LOGOUT' ? 'logged_out' : 'disconnected',
-            error: reason === 'LOGOUT' ? 'Logged out - scan QR again' : `Disconnected: ${reason}`,
-            user: null
-        });
-    });
-
-    return client;
+    return sock;
 }
 
 async function init() {
     if (state.connected) return getStatus();
-    if (client && ['initializing', 'qr_ready', 'authenticated'].includes(state.status)) return getStatus();
+    if (sock && ['initializing', 'qr_ready', 'reconnecting'].includes(state.status)) return getStatus();
 
     patchState({
         connected: false,
         status: 'initializing',
         error: null,
         qr: null,
-        qrDataUrl: null
+        qrDataUrl: null,
+        pairingCode: null
     });
 
     try {
-        createClient();
-        await client.initialize();
+        await createSocket();
     } catch (error) {
-        client = null;
+        sock = null;
         patchState({
             connected: false,
             status: 'error',
@@ -188,20 +186,45 @@ async function init() {
     return getStatus();
 }
 
-async function requestPairingCode() {
+async function requestPairingCode(phone) {
+    if (state.connected) return getStatus();
+
     await init();
-    return {
-        ...getStatus(),
-        pairingCode: null,
-        pairingSupported: false,
-        pairingMessage: 'This sender uses WhatsApp Web session auth. Scan the QR code shown here; it creates the exact session used by the sender.'
-    };
+
+    if (phone) {
+        const cleaned = phone.replace(/[^0-9]/g, '');
+        if (cleaned.length < 7) {
+            return {
+                ...getStatus(),
+                error: 'Invalid phone number. Include country code (e.g. 2349010926847)'
+            };
+        }
+        try {
+            if (!sock) return { ...getStatus(), error: 'Socket not initialized' };
+            const code = await sock.requestPairingCode(cleaned);
+            patchState({
+                status: 'pairing_code_ready',
+                pairingCode: code,
+                qr: null,
+                qrDataUrl: null,
+                error: null
+            });
+            return getStatus();
+        } catch (e) {
+            return {
+                ...getStatus(),
+                error: `Pairing code failed: ${e.message}`
+            };
+        }
+    }
+
+    return getStatus();
 }
 
 async function disconnect() {
-    if (client) {
-        try { await client.destroy(); } catch (_) {}
-        client = null;
+    if (sock) {
+        try { sock.end(undefined); } catch (_) {}
+        sock = null;
     }
     return patchState({
         connected: false,
@@ -209,15 +232,18 @@ async function disconnect() {
         user: null,
         error: null,
         qr: null,
-        qrDataUrl: null
+        qrDataUrl: null,
+        pairingCode: null
     });
 }
 
 async function resetSession() {
     await disconnect();
-    const sessionDir = path.join(AUTH_DIR, `session-${CLIENT_ID}`);
     try {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
+        const entries = fs.readdirSync(AUTH_DIR);
+        for (const entry of entries) {
+            fs.rmSync(path.join(AUTH_DIR, entry), { recursive: true, force: true });
+        }
     } catch (_) {}
     return patchState({
         connected: false,
@@ -225,7 +251,8 @@ async function resetSession() {
         user: null,
         error: null,
         qr: null,
-        qrDataUrl: null
+        qrDataUrl: null,
+        pairingCode: null
     });
 }
 
